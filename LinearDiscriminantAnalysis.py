@@ -14,8 +14,9 @@ from sklearn.cluster import AgglomerativeClustering
 from LDATrainingDataPreparation import TrainingData
 
 class LinearDiscriminantAnalysis:
-    def __init__ (self, trainingData, solver, S1_, S2_, regCoef, minSingVal):
+    def __init__ (self, trainingData, solver, metric_learning, S1_, S2_, regCoef, minSingVal):
         self.solver = solver
+        self.metric_learning = metric_learning
         self.S1_ = S1_
         self.S2_ = S2_
         self.regCoef = regCoef
@@ -35,7 +36,7 @@ class LinearDiscriminantAnalysis:
         self.L = trainingData.L
         self.Li = trainingData.Li
         self.label = trainingData.label
-
+        self.y = trainingData.y
         
     def computeSb(self):
         if 'svd' not in self.solver:
@@ -44,9 +45,8 @@ class LinearDiscriminantAnalysis:
                 for k in range (self.Ki[c]):
                     Mck = self.subclassMeans[c,k,:] - self.M
                     self.Sb = self.Sb + self.NKi[c,k] / self.N * np.outer (Mck, Mck)
-            result = self.Sb
         else:
-            result = None
+            self.Sb = None
 
         self.subclassWeight = np.zeros(self.L)
         idx = 0
@@ -55,7 +55,7 @@ class LinearDiscriminantAnalysis:
                 self.subclassWeight[idx] = self.NKi[c,k] / self.N
                 idx += 1
 
-        return result
+        return self.Sb
 
 
     def computeSw(self):
@@ -71,7 +71,6 @@ class LinearDiscriminantAnalysis:
                     idx1 = idx2
             self.Sw = Xnew.T @ Xnew  / self.N
             self.Sw = self.Sw + self.regCoef * np.diag (np.ones(self.d))
-            result = self.Sw
         elif 'svd' in self.solver:
             A = np.zeros([self.N, self.d])
             idx = 0
@@ -85,10 +84,11 @@ class LinearDiscriminantAnalysis:
             rank = np.sum(S > self.minSingVal)
             self.Sw_eigvec = VH[:rank].T
             self.Sw_singval = np.sqrt(S[:rank] ** 2 + self.regCoef)
-            result = (self.Sw_eigvec, self.Sw_singval)
+            self.Sw = (self.Sw_eigvec, self.Sw_singval)
         else:
             assert (0)
-        return result
+            
+        return self.Sw
 
 
     def computeSt(self):
@@ -96,27 +96,32 @@ class LinearDiscriminantAnalysis:
             X = self.X - self.M
             self.St = 1 / self.N * X.T @ X
             self.St = self.St + self.regCoef * np.diag (np.ones(self.d))
-            result = self.St
         elif 'svd' in self.solver:
             X = (self.X - self.M)/ np.sqrt(self.N)
             U, S, VH = np.linalg.svd( X, full_matrices=False)
             rank = np.sum(S > self.minSingVal)
             self.St_eigvec = VH[:rank].T
             self.St_singval = np.sqrt(S[:rank]**2 + self.regCoef)
-            result = (self.St_eigvec, self.St_singval)
+            self.St = (self.St_eigvec, self.St_singval)
         else:
             assert (0)
-        return result
+        return self.St
 
 
-    def fitFeatureExtractor(self):
+    def fitFeatureExtractor(self, normalize=True):
         idx = 0
         self.Mi = np.zeros([self.L, self.d])
         for c in range (self.C):
             for k in range (self.Ki[c]):
                 self.Mi[idx, :] = self.subclassMeans[c,k] - self.M
                 idx += 1
-                    
+        
+        #if 'svd' in self.solver:
+        #    assert (self.S2_ == 'St')
+            
+        #if 'ghiasi' in self.solver:
+        #    assert (self.S2_ == 'St')            
+            
         if self.solver == 'orthogonal_centroid':
             Q, R = np.linalg.qr (self.Mi.T, mode = 'reduced')
             self.model = Q.T
@@ -124,16 +129,23 @@ class LinearDiscriminantAnalysis:
         
         if self.S1_ == 'Sb':
             if 'S1' not in self.__dict__:
-                self.S1 = self.computeSb()
+                if 'Sb' not in self.__dict__:
+                    self.S1 = self.computeSb()
+                else:
+                    self.S1 = self.Sb
         else:
             assert (0)
 
         if self.S2_ == 'St':
             if 'St' not in self.__dict__:
                 self.S2 = self.computeSt()
+            else:
+                self.S2 = self.St
         elif self.S2_ == 'Sw':
             if 'Sw' not in self.__dict__:
                 self.S2 = self.computeSw()
+            else:
+                self.S2 = self.Sw
         else:
             assert (0)
 
@@ -183,12 +195,68 @@ class LinearDiscriminantAnalysis:
             (eigenvec, singval) = self.S2
             A = self.Mi @ eigenvec
             A *= np.array(1/singval)
-            A = A @ eigenvec.T    # Kept to allow visualization			
+            A = A @ eigenvec.T    # Kept to allow visualization                
         else:
             assert (0)
         
-        A = A.T / np.linalg.norm(A, axis=1)
-        self.model = A.T
+        if 'ghiasi' in self.solver:
+            if self.metric_learning == 'none':
+                pass
+            elif self.metric_learning == 'eig':
+                Q = np.diag(self.Li / np.sum(self.Li))
+                B = Q @ self.Mi @ A.T
+                (eigvalsZ, Z) = np.linalg.eig(B)
+                idx = eigvalsZ.argsort()[::-1]
+                Z = Z[:,idx]
+                eigvalsZ = eigvalsZ[idx]
+                # Since we extract L features, Z is singular.
+                # However, it should not have more than one zero eigenvalue.
+                # Otherwise the objective function would decrease.
+                if eigvalsZ[-2] > 1e-12:
+                    A = Z.T @ A
+                else:
+                    print ('Z not applied.')
+            elif self.metric_learning == 'pinv':
+                Q = np.diag(self.Li / np.sum(self.Li))
+                B = Q @ self.Mi @ A.T @ Q
+                Z = np.linalg.pinv(B)
+                A = Z.T @ A
+            elif self.metric_learning == 'pinv_cluster':
+                B = self.X @ A.T 
+                E = np.zeros([self.L, self.N])
+                i = 0
+                for c in range(self.L):
+                    for j in range(int(self.Li[c])):
+                        E[c,i+j] = 1
+                    i += int(self.Li[c])
+                Z = np.linalg.pinv(B) @ E.T
+                A = Z.T @ A
+            elif self.metric_learning == 'pinv_class':
+                #Q = np.diag(self.Li / np.sum(self.Li))
+                B = self.X @ A.T  #Q @ 
+                E = np.zeros([self.C, self.N])
+                for i in range (self.N):
+                    c = self.y[i]
+                    E[c,i] = 1
+                Z = np.linalg.pinv(B) @ E.T
+                A = Z.T @ A
+            elif self.metric_learning == 'lda':
+                MHat = self.Mi[:-1,:]
+                QHat = np.diag(self.Li[:-1]/self.N)
+                NHat = np.reshape(self.Li[:-1]/self.Li[-1], [self.L-1,1])
+                QTilde = QHat + self.Li[-1]/self.N* NHat @ NHat.T
+                B = QTilde @ self.Mi[:-1,:] @ A.T[:,:-1]
+                (eigvalsZ, Z) = np.linalg.eig(B)
+                A = Z.T @ A[:-1,:]
+            else:
+                assert (0)
+            
+        if normalize:
+            A = A.T / np.linalg.norm(A, axis=1)
+            self.model = A.T
+        else:
+            self.model = A
+        
         return
 
 
@@ -196,7 +264,7 @@ class LinearDiscriminantAnalysis:
         if 'svd' not in self.solver:
             if 'SwInv' not in self.__dict__:
                 if 'Sw' not in self.__dict__:
-                    self.Sw = self.computeSw()
+                    self.computeSw()
                 self.SwInv = np.linalg.pinv(self.Sw)
             self.linclass_weights = self.Mi @ self.SwInv
         elif 'svd' in self.solver:
@@ -248,13 +316,16 @@ class LinearDiscriminantAnalysis:
     def computeFeatureSpaceScatterMatrices(self):
         A = self.model[0:self.L-1, :]
         # The objective function is invariant to any non-singular transformation
-        #if 'ghiasi' in self.solver:
+        # if 'ghiasi' in self.solver:
         #    A = A * self.subclassWeight.reshape([A.shape[0], 1])
 
         if 'St' not in self.__dict__:
-            self.St = self.computeSt()
+            self.computeSt()
         if 'S1' not in self.__dict__:    # for orthogonal_centroid
-            self.S1 = self.computeSb()
+            if 'Sb' not in self.__dict__:
+                self.S1 = self.computeSb()
+            else:
+                self.S1 = self.Sb
 
         if 'svd' not in self.solver:
             St_Y = A @ self.St @ A.T
@@ -281,18 +352,27 @@ class LinearDiscriminantAnalysis:
     
     def objective(self):
         (S1_Y, St_Y) = self.computeFeatureSpaceScatterMatrices()
+        #U, S, VH = np.linalg.svd(S2_Y)
+        #rank = np.sum(S > self.minSingVal)
+        #U = U[:,:rank]        
+        #S = S[:rank]
+        #VH = VH[0:rank,:]
+        #objective = np.trace(VH.T @ np.diag( 1/S) @ U.T @ S1_Y)
+        #objective = np.trace(np.linalg.inv(S2_Y) @ S1_Y)
         objective = np.trace(np.linalg.pinv(St_Y) @ S1_Y)
         return objective
 
     #Objective in Generalized Discriminant Analysis
     def objective2(self):
+        #A = self.model[0:self.L-1, :]
         (S1_Y, S2_Y) = self.computeFeatureSpaceScatterMatrices()
-        S2_Y += np.diag(np.ones([S2_Y.shape[0]])) * 1e-10
+        S2_Y += np.diag(np.ones([S2_Y.shape[0]])* 1e-10)
         (eigvals, eigvecs) = scipy.linalg.eigh(S1_Y, S2_Y)
         objective = np.sum(eigvals)
         return objective
         
-    def GenerateImagesOfLinearFeatureExtractorWeights(self, width, height, color = 'color', nImages=1, rows=None, cols=None):
+    def GenerateImagesOfLinearFeatureExtractorWeights(self, width, height, color = 'color',
+                        nImages=1, rows=None, cols=None):
         A = self.model
         nFeaturesPerImage = rows * cols  # (A.shape[0] + 1) // nImages
         if rows == None or cols == None:
